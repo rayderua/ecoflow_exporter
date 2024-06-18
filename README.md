@@ -83,6 +83,10 @@ Optional:
 
 `LOG_LEVEL` - (default: `INFO`) Possible values: `DEBUG`, `INFO`, `WARNING`, `ERROR`
 
+`EXPORTER_OFFLINE_EXIT` - (default: False) Exit if device is offline 
+
+`EXPORTER_OFFLINE_COUNT` - (default: 3) Count of attempts before exiting
+
 - Example of running docker image:
 
 ```bash
