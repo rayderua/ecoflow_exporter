@@ -14,6 +14,7 @@ from multiprocessing import Process
 import requests
 import paho.mqtt.client as mqtt
 from prometheus_client import start_http_server, REGISTRY, Gauge, Counter
+from dotenv import load_dotenv
 
 
 class JsonFormatter(log.Formatter):
@@ -277,13 +278,16 @@ class EcoflowMetric:
 
 
 class Worker:
-    def __init__(self, message_queue, device_name, collecting_interval_seconds=10):
+    def __init__(self, message_queue, device_name, collecting_interval_seconds=10,offline_exit=False,offline_count=3):
         self.message_queue = message_queue
         self.device_name = device_name
         self.collecting_interval_seconds = collecting_interval_seconds
         self.metrics_collector = []
         self.online = Gauge("ecoflow_online", "1 if device is online", labelnames=["device"])
         self.mqtt_messages_receive_total = Counter("ecoflow_mqtt_messages_receive_total", "total MQTT messages", labelnames=["device"])
+        self.offline_exit = offline_exit
+        self.offline_count = offline_count
+        self.offline_check = 0
 
     def loop(self):
         time.sleep(self.collecting_interval_seconds)
@@ -293,12 +297,20 @@ class Worker:
                 log.info(f"Processing {queue_size} event(s) from the message queue")
                 self.online.labels(device=self.device_name).set(1)
                 self.mqtt_messages_receive_total.labels(device=self.device_name).inc(queue_size)
+                self.offline_check = 0
             else:
                 log.info("Message queue is empty. Assuming that the device is offline")
                 self.online.labels(device=self.device_name).set(0)
                 # Clear metrics for NaN (No data) instead of last value
                 for metric in self.metrics_collector:
                     metric.clear()
+
+                if self.offline_exit:
+                    self.offline_check += 1
+                    log.info(f"offline_check =  {self.offline_check}")
+                    if self.offline_check > self.offline_count:
+                        log.info(f"Device is too long offline. Stopping")
+                        exit(1)
 
             while not self.message_queue.empty():
                 payload = self.message_queue.get()
@@ -358,7 +370,16 @@ def signal_handler(signum, frame):
     sys.exit(0)
 
 
+def get_env(name, default):
+    result = os.getenv(name)
+    if result is None:
+        result = default
+
+    return result
+
+
 def main():
+    load_dotenv()
     # Register the signal handler for SIGTERM
     signal.signal(signal.SIGTERM, signal_handler)
 
@@ -400,8 +421,11 @@ def main():
     exporter_port = int(os.getenv("EXPORTER_PORT", "9090"))
     collecting_interval_seconds = int(os.getenv("COLLECTING_INTERVAL", "10"))
     timeout_seconds = int(os.getenv("MQTT_TIMEOUT", "60"))
+    offline_exit = os.getenv("EXPORTER_OFFLINE_EXIT", False)
+    offline_count = int(os.getenv("EXPORTER_OFFLINE_COUNT", 3))
+    scrape_interval = int(os.getenv("EXPORTER_SCRAPE_INTERVAL", 10))
 
-    if (not device_sn or not ecoflow_username or not ecoflow_password):
+    if not device_sn or not ecoflow_username or not ecoflow_password:
         log.error("Please, provide all required environment variables: DEVICE_SN, ECOFLOW_USERNAME, ECOFLOW_PASSWORD")
         sys.exit(1)
 
@@ -413,9 +437,23 @@ def main():
 
     message_queue = Queue()
 
-    EcoflowMQTT(message_queue, device_sn, auth.mqtt_username, auth.mqtt_password, auth.mqtt_url, auth.mqtt_port, auth.mqtt_client_id, timeout_seconds)
+    # def __init__(self, message_queue, device_sn, username, password, addr, port, client_id, timeout_seconds):
+    EcoflowMQTT(message_queue=message_queue,
+                device_sn=device_sn,
+                username=auth.mqtt_username,
+                password=auth.mqtt_password,
+                addr=auth.mqtt_url,
+                port=auth.mqtt_port,
+                client_id=auth.mqtt_client_id,
+                timeout_seconds=timeout_seconds,
+                )
 
-    metrics = Worker(message_queue, device_name, collecting_interval_seconds)
+    metrics = Worker(message_queue=message_queue,
+                     device_name=device_name,
+                     collecting_interval_seconds=collecting_interval_seconds,
+                     offline_exit=offline_exit,
+                     offline_count=offline_count,
+                     )
 
     start_http_server(exporter_port)
 
