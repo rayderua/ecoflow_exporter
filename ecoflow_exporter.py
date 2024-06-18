@@ -70,6 +70,7 @@ class JsonFormatter(log.Formatter):
 
         return json.dumps(message_dict, default=str)
 
+
 class RepeatTimer(Timer):
     def run(self):
         while not self.finished.wait(self.interval):
