@@ -98,12 +98,15 @@ class EcoflowAuthentication:
 
 class EcoflowMQTT():
 
-    def __init__(self, message_queue, device_sn, username, password, addr, port, client_id, timeout_seconds):
+    def __init__(self, message_queue, device_sn, device_type, username, password, addr, port, client_id, timeout_seconds):
         self.message_queue = message_queue
         self.addr = addr
         self.port = port
         self.username = username
         self.password = password
+        self.device_type = device_type
+        self.device_sn = device_sn
+        self.device = None
         self.client_id = client_id
         self.topic = f"/app/device/property/{device_sn}"
         self.timeout_seconds = timeout_seconds
@@ -115,6 +118,23 @@ class EcoflowMQTT():
         self.idle_timer = RepeatTimer(10, self.idle_reconnect)
         self.idle_timer.daemon = True
         self.idle_timer.start()
+
+
+    def __is_json(self, payload: bytes) -> bool:
+        try:
+            text = payload.decode("utf-8")
+        except UnicodeDecodeError:
+            return False
+
+        text = text.strip()
+        if not (text.startswith("{") or text.startswith("[")):
+            return False
+
+        try:
+            json.loads(text)
+            return True
+        except json.JSONDecodeError:
+            return False
 
     def connect(self):
         if self.client:
@@ -184,16 +204,38 @@ class EcoflowMQTT():
             time.sleep(5)
 
     def on_message(self, client, userdata, message):
-        self.message_queue.put(message.payload.decode("utf-8"))
+
+        if self.device_type is None:
+            self.message_queue.put(message.payload.decode("utf-8"))
+            self.last_message_time = time.time()
+        else:
+            if self.device is None:
+                match self.device_type:
+                    case 'river3':
+                        from devices.river3 import EcoflowRiver3
+                        self.device = EcoflowRiver3()
+                    case 'unsupported':
+                        return
+                    case _:
+                        self.device_type = 'unsupported'
+                        log.error(f"Unsupported device: {self.device_type}")
+
+            if self.device is not None:
+                payload = self.device.get_payload(raw_data=message.payload)
+                print(payload)
+                self.message_queue.put(self.device.get_payload(raw_data=message.payload))
+
         self.last_message_time = time.time()
 
 
 class EcoflowMetric:
-    def __init__(self, ecoflow_payload_key, device_name):
-        self.ecoflow_payload_key = ecoflow_payload_key
-        self.device_name = device_name
+    def __init__(self, metric_data: dict):
+        self.ecoflow_payload_key = metric_data['name']
         self.name = f"ecoflow_{self.convert_ecoflow_key_to_prometheus_name()}"
-        self.metric = Gauge(self.name, f"value from MQTT object key {ecoflow_payload_key}", labelnames=["device"])
+        self.labels = metric_data['labels']
+        self.metric_key = (f"{metric_data['name']}|" + "|".join(f"{k}={v}" for k, v in sorted(metric_data['labels'].items())))
+        self.metric = Gauge(self.name, f"value from MQTT object key {self.ecoflow_payload_key}", labelnames=self.labels.keys())
+
 
     def convert_ecoflow_key_to_prometheus_name(self):
         # bms_bmsStatus.maxCellTemp -> bms_bms_status_max_cell_temp
@@ -215,7 +257,7 @@ class EcoflowMetric:
         # WARNING! This will ruin all Prometheus historical data and backward compatibility of Grafana dashboard
         # value = value / 1000 if value.endswith("_vol") or value.endswith("_amp") else value
         log.debug(f"Set {self.name} = {value}")
-        self.metric.labels(device=self.device_name).set(value)
+        self.metric.labels(**self.labels).set(value)
 
     def clear(self):
         log.debug(f"Clear {self.name}")
@@ -264,6 +306,7 @@ class Worker:
 
             time.sleep(self.collecting_interval_seconds)
 
+
     def get_metric_by_ecoflow_payload_key(self, ecoflow_payload_key):
         for metric in self.metrics_collector:
             if metric.ecoflow_payload_key == ecoflow_payload_key:
@@ -272,31 +315,71 @@ class Worker:
         log.debug(f"Cannot find metric linked to {ecoflow_payload_key}")
         return False
 
+
     def process_payload(self, params):
         log.debug(f"Processing params: {params}")
         for ecoflow_payload_key in params.keys():
             ecoflow_payload_value = params[ecoflow_payload_key]
-            if not isinstance(ecoflow_payload_value, (int, float)):
-                log.warning(f"Skipping unsupported metric {ecoflow_payload_key}: {ecoflow_payload_value}")
+
+            if not isinstance(ecoflow_payload_value, (int, float, str, list)):
+                log.warning(f"Skipping unsupported metric {type(ecoflow_payload_value)} = {ecoflow_payload_key}: {ecoflow_payload_value}")
                 continue
 
-            metric = self.get_metric_by_ecoflow_payload_key(ecoflow_payload_key)
-            if not metric:
-                try:
-                    metric = EcoflowMetric(ecoflow_payload_key, self.device_name)
-                except EcoflowMetricException as error:
-                    log.error(error)
-                    continue
-                log.info(f"Created new metric from payload key {metric.ecoflow_payload_key} -> {metric.name}")
-                self.metrics_collector.append(metric)
+            metrics = []
+            if isinstance(ecoflow_payload_value, (int, float)):
+                metrics.append({
+                    'name': ecoflow_payload_key,
+                    'value': ecoflow_payload_value,
+                    'labels': { 'device': self.device_name }
+                })
 
-            metric.set(ecoflow_payload_value)
+            if isinstance(ecoflow_payload_value, (str)):
+                metrics.append({
+                    'name': ecoflow_payload_key,
+                    'value': 0,
+                    'labels': {
+                        'device': self.device_name,
+                        'value': ecoflow_payload_value
+                    }
+                })
 
-            if ecoflow_payload_key == 'inv.acInVol' and ecoflow_payload_value == 0:
-                ac_in_current = self.get_metric_by_ecoflow_payload_key('inv.acInAmp')
-                if ac_in_current:
-                    log.debug("Set AC inverter input current to zero because of zero inverter voltage")
-                    ac_in_current.set(0)
+            if isinstance(ecoflow_payload_value, (list)):
+                for index, value in enumerate(ecoflow_payload_value):
+                    if isinstance(value, (int, float)):
+                        metrics.append({
+                            'name': ecoflow_payload_key,
+                            'value': value,
+                            'labels': {
+                                'device': self.device_name,
+                                'num': index,
+                            }
+                        })
+                    else:
+                        log.warning(f"Skipping unsupported metric {type(ecoflow_payload_value)} = {ecoflow_payload_key}: {ecoflow_payload_value}")
+                        continue
+
+            for _metric in metrics:
+                # metric = self.get_metric_by_ecoflow_payload_key(_metric)
+                metric = self.get_metric_by_ecoflow_payload_key(_metric['name'])
+                if not metric:
+                    try:
+                        metric = EcoflowMetric(_metric)
+
+                    except EcoflowMetricException as error:
+                        log.error(error)
+                        continue
+
+                    log.info(f"Created new metric from payload key {metric.ecoflow_payload_key} -> {metric.name}")
+                    self.metrics_collector.append(metric)
+
+                # metric.set(_metric['value'])
+                metric.metric.labels(**_metric['labels']).set(_metric['value'])
+
+                if ecoflow_payload_key == 'inv.acInVol' and ecoflow_payload_value == 0:
+                    ac_in_current = self.get_metric_by_ecoflow_payload_key('inv.acInAmp')
+                    if ac_in_current:
+                        log.debug("Set AC inverter input current to zero because of zero inverter voltage")
+                        ac_in_current.set(0)
 
 
 def signal_handler(signum, frame):
@@ -330,6 +413,7 @@ def main():
 
     device_sn = os.getenv("DEVICE_SN")
     device_name = os.getenv("DEVICE_NAME") or device_sn
+    device_type = os.getenv("DEVICE_TYPE") or None
     ecoflow_username = os.getenv("ECOFLOW_USERNAME")
     ecoflow_password = os.getenv("ECOFLOW_PASSWORD")
     ecoflow_api_host = os.getenv("ECOFLOW_API_HOST", "api.ecoflow.com")
@@ -349,7 +433,7 @@ def main():
 
     message_queue = Queue()
 
-    EcoflowMQTT(message_queue, device_sn, auth.mqtt_username, auth.mqtt_password, auth.mqtt_url, auth.mqtt_port, auth.mqtt_client_id, timeout_seconds)
+    EcoflowMQTT(message_queue, device_sn, device_type, auth.mqtt_username, auth.mqtt_password, auth.mqtt_url, auth.mqtt_port, auth.mqtt_client_id, timeout_seconds)
 
     metrics = Worker(message_queue, device_name, collecting_interval_seconds)
 
