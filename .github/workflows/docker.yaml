@@ -54,7 +54,7 @@ jobs:
             # set latest tag for master branch
             type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', 'master') }}
             # short commit hash for develop
-            type=raw,value=${{ github.sha[0:7] }},enable=${{ github.ref_name == 'develop' }}
+            type=raw,value=${{ github.sha }},enable=${{ github.ref_name == 'develop' }}
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
