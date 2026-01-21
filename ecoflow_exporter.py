@@ -78,7 +78,8 @@ class EcoflowAuthentication:
 
         log.info(f"Successfully extracted account: {self.mqtt_username}")
 
-    def get_json_response(self, request):
+    @staticmethod
+    def get_json_response(request):
         if request.status_code != 200:
             raise Exception(f"Got HTTP status code {request.status_code}: {request.text}")
 
@@ -86,7 +87,7 @@ class EcoflowAuthentication:
             response = json.loads(request.text)
             response_message = response["message"]
         except KeyError as key:
-            raise Exception(f"Failed to extract key {key} from {response}")
+            raise Exception(f"Failed to extract key {key} from {request.text}")
         except Exception as error:
             raise Exception(f"Failed to parse response: {request.text} Error: {error}")
 
@@ -96,8 +97,7 @@ class EcoflowAuthentication:
         return response
 
 
-class EcoflowMQTT():
-
+class EcoflowMQTT:
     def __init__(self, message_queue, device_sn, device_type, username, password, addr, port, client_id, timeout_seconds):
         self.message_queue = message_queue
         self.addr = addr
@@ -120,7 +120,8 @@ class EcoflowMQTT():
         self.idle_timer.start()
 
 
-    def __is_json(self, payload: bytes) -> bool:
+    @staticmethod
+    def __is_json(payload: bytes) -> bool:
         try:
             text = payload.decode("utf-8")
         except UnicodeDecodeError:
@@ -136,12 +137,16 @@ class EcoflowMQTT():
         except json.JSONDecodeError:
             return False
 
+
     def connect(self):
         if self.client:
             self.client.loop_stop()
             self.client.disconnect()
 
-        self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, self.client_id)
+        self.client = mqtt.Client(
+            client_id=self.client_id,
+            callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+        )
         self.client.username_pw_set(self.username, self.password)
         self.client.tls_set(certfile=None, keyfile=None, cert_reqs=ssl.CERT_REQUIRED)
         self.client.tls_insecure_set(False)
@@ -152,6 +157,7 @@ class EcoflowMQTT():
         log.info(f"Connecting to MQTT Broker {self.addr}:{self.port} using client id {self.client_id}")
         self.client.connect(self.addr, self.port)
         self.client.loop_start()
+
 
     def idle_reconnect(self):
         if self.last_message_time and time.time() - self.last_message_time > self.timeout_seconds:
@@ -173,7 +179,8 @@ class EcoflowMQTT():
                 else:
                     log.error("Reconnection errored out, or timed out, attempted to reconnect...")
 
-    def on_connect(self, client, userdata, flags, reason_code, properties):
+
+    def on_connect(self, client, _userdata, _flags, reason_code, _properties):
         # Initialize the time of last message at least once upon connection so that other things that rely on that to be
         # set (like idle_reconnect) work
         self.last_message_time = time.time()
@@ -194,17 +201,19 @@ class EcoflowMQTT():
             case "Not authorized":
                 log.error("Failed to connect to MQTT: not authorised")
             case _:
-                log.error(f"Failed to connect to MQTT: another error occured: {reason_code}")
+                log.error(f"Failed to connect to MQTT: another error occurred: {reason_code}")
 
         return client
 
-    def on_disconnect(self, client, userdata, flags, reason_code, properties):
+
+    @staticmethod
+    def on_disconnect(self, _client, _userdata, _flags, reason_code, _properties): # noqa: F841
         if reason_code > 0:
             log.error(f"Unexpected MQTT disconnection: {reason_code}. Will auto-reconnect")
             time.sleep(5)
 
-    def on_message(self, client, userdata, message):
 
+    def on_message(self, _client, _userdata, message):
         if self.device_type is None:
             self.message_queue.put(message.payload.decode("utf-8"))
             self.last_message_time = time.time()
@@ -221,8 +230,6 @@ class EcoflowMQTT():
                         log.error(f"Unsupported device: {self.device_type}")
 
             if self.device is not None:
-                payload = self.device.get_payload(raw_data=message.payload)
-                print(payload)
                 self.message_queue.put(self.device.get_payload(raw_data=message.payload))
 
         self.last_message_time = time.time()
@@ -252,12 +259,14 @@ class EcoflowMetric:
             raise EcoflowMetricException(f"Cannot convert payload key {self.ecoflow_payload_key} to comply with the Prometheus data model. Please, raise an issue!")
         return new
 
+
     def set(self, value):
         # According to best practices for naming metrics and labels, the voltage should be in volts and the current in amperes
         # WARNING! This will ruin all Prometheus historical data and backward compatibility of Grafana dashboard
         # value = value / 1000 if value.endswith("_vol") or value.endswith("_amp") else value
         log.debug(f"Set {self.name} = {value}")
         self.metric.labels(**self.labels).set(value)
+
 
     def clear(self):
         log.debug(f"Clear {self.name}")
@@ -272,6 +281,7 @@ class Worker:
         self.metrics_collector = []
         self.online = Gauge("ecoflow_online", "1 if device is online", labelnames=["device"])
         self.mqtt_messages_receive_total = Counter("ecoflow_mqtt_messages_receive_total", "total MQTT messages", labelnames=["device"])
+
 
     def loop(self):
         time.sleep(self.collecting_interval_seconds)
@@ -290,19 +300,19 @@ class Worker:
 
             while not self.message_queue.empty():
                 payload = self.message_queue.get()
-                log.debug(f"Recived payload: {payload}")
+                log.debug(f"Received payload: {payload}")
                 if payload is None:
                     continue
 
                 try:
                     payload = json.loads(payload)
                     params = payload['params']
+                    self.process_payload(params)
                 except KeyError as key:
                     log.error(f"Failed to extract key {key} from payload: {payload}")
                 except Exception as error:
                     log.error(f"Failed to parse MQTT payload: {payload} Error: {error}")
                     continue
-                self.process_payload(params)
 
             time.sleep(self.collecting_interval_seconds)
 
@@ -322,7 +332,7 @@ class Worker:
             ecoflow_payload_value = params[ecoflow_payload_key]
 
             if not isinstance(ecoflow_payload_value, (int, float, str, list)):
-                log.warning(f"Skipping unsupported metric {type(ecoflow_payload_value)} = {ecoflow_payload_key}: {ecoflow_payload_value}")
+                log.warning(f"Skipping unsupported metric(1) {type(ecoflow_payload_value)} = {ecoflow_payload_key}: {ecoflow_payload_value}")
                 continue
 
             metrics = []
@@ -333,7 +343,10 @@ class Worker:
                     'labels': { 'device': self.device_name }
                 })
 
-            if isinstance(ecoflow_payload_value, (str)):
+            if isinstance(ecoflow_payload_value, str):
+                if len(ecoflow_payload_value) == 0:
+                    log.warning(f"Skipping empty string value {type(ecoflow_payload_value)} = {ecoflow_payload_key}: {ecoflow_payload_value}")
+                    continue
                 metrics.append({
                     'name': ecoflow_payload_key,
                     'value': 0,
@@ -343,8 +356,12 @@ class Worker:
                     }
                 })
 
-            if isinstance(ecoflow_payload_value, (list)):
+            if isinstance(ecoflow_payload_value, list):
                 for index, value in enumerate(ecoflow_payload_value):
+                    if not isinstance(value, (int, float, dict)):
+                        log.warning(f"Skipping unsupported metric(3) {type(value)} = {ecoflow_payload_key}: {ecoflow_payload_value}->[{index}]{value}")
+                        continue
+
                     if isinstance(value, (int, float)):
                         metrics.append({
                             'name': ecoflow_payload_key,
@@ -354,9 +371,20 @@ class Worker:
                                 'num': index,
                             }
                         })
-                    else:
-                        log.warning(f"Skipping unsupported metric {type(ecoflow_payload_value)} = {ecoflow_payload_key}: {ecoflow_payload_value}")
-                        continue
+
+                    if isinstance(value, dict) and 'statistics_object' in value:
+                        metric_key =  value['statistics_object'].removeprefix("STATISTICS_OBJECT_").lower()
+                        metric_value = 0
+                        if 'statistics_content' in  value:
+                            metric_value = value['statistics_content']
+
+                        metrics.append({
+                            'name': f"statistics_{metric_key}",
+                            'value': metric_value,
+                            'labels': {
+                                'device': self.device_name,
+                            }
+                        })
 
             for _metric in metrics:
                 # metric = self.get_metric_by_ecoflow_payload_key(_metric)
@@ -372,17 +400,16 @@ class Worker:
                     log.info(f"Created new metric from payload key {metric.ecoflow_payload_key} -> {metric.name}")
                     self.metrics_collector.append(metric)
 
-                # metric.set(_metric['value'])
                 metric.metric.labels(**_metric['labels']).set(_metric['value'])
 
                 if ecoflow_payload_key == 'inv.acInVol' and ecoflow_payload_value == 0:
                     ac_in_current = self.get_metric_by_ecoflow_payload_key('inv.acInAmp')
                     if ac_in_current:
                         log.debug("Set AC inverter input current to zero because of zero inverter voltage")
-                        ac_in_current.set(0)
+                        ac_in_current.metric.labels(**_metric['labels']).set(0)
 
 
-def signal_handler(signum, frame):
+def signal_handler(signum, _frame):
     log.info(f"Received signal {signum}. Exiting...")
     sys.exit(0)
 
@@ -392,10 +419,11 @@ def main():
     signal.signal(signal.SIGTERM, signal_handler)
 
     # Disable Process and Platform collectors
+    # pylint: disable=protected-access
     for coll in list(REGISTRY._collector_to_names.keys()):
         REGISTRY.unregister(coll)
 
-    log_level = os.getenv("LOG_LEVEL", "INFO")
+    log_level = os.getenv("LOG_LEVEL", "WARNING")
 
     match log_level:
         case "DEBUG":
@@ -407,7 +435,7 @@ def main():
         case "ERROR":
             log_level = log.ERROR
         case _:
-            log_level = log.INFO
+            log_level = log.WARNING
 
     log.basicConfig(stream=sys.stdout, level=log_level, format='%(asctime)s %(levelname)-7s %(message)s')
 
@@ -421,7 +449,7 @@ def main():
     collecting_interval_seconds = int(os.getenv("COLLECTING_INTERVAL", "10"))
     timeout_seconds = int(os.getenv("MQTT_TIMEOUT", "60"))
 
-    if (not device_sn or not ecoflow_username or not ecoflow_password):
+    if not device_sn or not ecoflow_username or not ecoflow_password:
         log.error("Please, provide all required environment variables: DEVICE_SN, ECOFLOW_USERNAME, ECOFLOW_PASSWORD")
         sys.exit(1)
 
